@@ -10,17 +10,25 @@ on:
       force_build:
         description: 'Force build even if no new commits'
         required: false
-        default: 'false'
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check-updates:
     runs-on: ubuntu-latest
     outputs:
-      skip: ${{ steps.check.outputs.skip }}
       commit: ${{ steps.check.outputs.commit }}
+      time: ${{ steps.check.outputs.time }}
+      timestamp: ${{ steps.check.outputs.timestamp }}
+      skip: ${{ steps.check.outputs.skip }}
+
     steps:
       - name: Check for new ANGLE commits
         id: check
@@ -29,7 +37,9 @@ jobs:
         run: |
           # 获取 angle/angle 仓库 main 分支的最新 commit hash
           LATEST_COMMIT=$(git ls-remote https://chromium.googlesource.com/angle/angle.git refs/heads/main | awk '{print $1}')
-          echo "commit=$LATEST_COMMIT" | tee -a $GITHUB_OUTPUT
+          echo "commit=$LATEST_COMMIT
+          time=$(TZ=Asia/Shanghai date "+%F %T")
+          timestamp=$(date +%s)" | tee -a $GITHUB_OUTPUT
 
           FORCE_BUILD="${{ github.event.inputs.force_build }}"
           if [[ "$FORCE_BUILD" == "true" ]]; then
@@ -52,12 +62,20 @@ jobs:
     needs: check-updates
     if: needs.check-updates.outputs.skip == 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+          - arch: x64
+
+    outputs:
+      version: ${{ steps.package.outputs.version }}
 
     env:
       DEPOT_TOOLS_PATH: ${{ github.workspace }}/depot_tools
       ANGLE_ROOT: ${{ github.workspace }}/angle
-      LATEST_COMMIT: ${{ needs.check-updates.outputs.commit }}
 
     steps:
       - name: Checkout repository
@@ -139,7 +157,7 @@ jobs:
           cd "$ANGLE_ROOT"
           gn gen out/Android --args='
             target_os = "android"
-            target_cpu = "arm64"
+            target_cpu = "${{ matrix.arch }}"
             is_component_build = false
             is_debug = false
             arm_control_flow_integrity = "none"
@@ -169,20 +187,30 @@ jobs:
 
       - name: Build ANGLE APK
         run: |
-          cd "$ANGLE_ROOT"
-          autoninja -C out/Android angle_apks
+          pushd "$ANGLE_ROOT"
+            autoninja -C out/Android angle_apks
+          popd
+          mv "$ANGLE_ROOT/out/Android/apks/AngleLibraries.apk" "AngleLibraries-${{ matrix.arch }}.apk"
 
-      - name: Package Module and Publish
+      - name: Upload ANGLE APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-apk-${{ matrix.arch }}
+          path: AngleLibraries-${{ matrix.arch }}.apk
+          if-no-files-found: error
+
+      - name: Package Module
+        id: package
         env:
-          GH_TOKEN: ${{ github.token }}
+          LATEST_COMMIT: ${{ needs.check-updates.outputs.commit }}
         run: |
           # 解压指定的 so 文件到 module/system/lib64/
           7z e \
             -omodule/system/lib64/ \
-            "$ANGLE_ROOT/out/Android/apks/AngleLibraries.apk" \
-            "lib/arm64-v8a/libEGL_angle.so" \
-            "lib/arm64-v8a/libGLESv1_CM_angle.so" \
-            "lib/arm64-v8a/libGLESv2_angle.so"
+            "AngleLibraries-${{ matrix.arch }}.apk" \
+            "lib/*/libEGL_angle.so" \
+            "lib/*/libGLESv1_CM_angle.so" \
+            "lib/*/libGLESv2_angle.so"
 
           # 提取 ANGLE 版本号
           MAJOR=$(grep "ANGLE_MAJOR_VERSION" "$ANGLE_ROOT/src/common/angle_version.h" | awk '{print $3}' | head -n 1)
@@ -192,34 +220,45 @@ jobs:
           MINOR=${MINOR:-1}
           PATCH=1
 
-          ANGLE_VERSION="$(TZ=Asia/Shanghai date "+%F %T") (ANGLE ${MAJOR}.${MINOR}.${PATCH} git hash: ${LATEST_COMMIT:0:12})"
+          ANGLE_VERSION="(ANGLE ${MAJOR}.${MINOR}.${PATCH} git hash: ${LATEST_COMMIT:0:12})"
           TIMESTAMP="$(date +%s)"
 
-          echo "version=${ANGLE_VERSION}" >> module/module.prop
-          echo "versionCode=${TIMESTAMP}" >> module/module.prop
+          echo "version=${{ needs.check-updates.outputs.time }} ${ANGLE_VERSION}
+          versionCode=${{ needs.check-updates.outputs.timestamp }}" >> module/module.prop
+          echo "version=${ANGLE_VERSION}" | tee -a "$GITHUB_OUTPUT"
 
           cd module
-          7z -mm=xz -mx=9 a ../AngleLibraries.zip
-          cd ..
-
-          # 发布到 releases 的 nightly 通道
-          gh release delete nightly -y --cleanup-tag || true
-          gh release create nightly AngleLibraries.zip "$ANGLE_ROOT/out/Android/apks/AngleLibraries.apk" \
-            --title "Nightly Build" \
-            --notes "Commit: [${LATEST_COMMIT}](https://chromium.googlesource.com/angle/angle/+/${LATEST_COMMIT})
-          Version: ${ANGLE_VERSION}
-          Timestamp: ${TIMESTAMP}"
-
-      - name: Upload ANGLE APK
-        uses: actions/upload-artifact@v7
-        with:
-          name: angle-apk
-          path: ${{ env.ANGLE_ROOT }}/out/Android/apks/AngleLibraries.apk
-          if-no-files-found: error
+          7z -mm=xz -mx=9 a "../AngleLibraries-${{ matrix.arch }}.zip"
 
       - name: Upload Module Zip
         uses: actions/upload-artifact@v7
         with:
-          name: angle-module
-          path: AngleLibraries.zip
+          name: angle-module-${{ matrix.arch }}
+          path: "AngleLibraries-${{ matrix.arch }}.zip"
           if-no-files-found: error
+
+  release:
+    needs:
+      - check-updates
+      - build-angle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: angle-*
+          path: assets
+          merge-multiple: true
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: assets/*
+          tag_name: nightly
+          name: Nightly Build
+          body: |
+            Commit: [${{ needs.check-updates.outputs.commit }}](https://chromium.googlesource.com/angle/angle/+log/${{ needs.check-updates.outputs.commit }})
+            Version: ${{ needs.check-updates.outputs.time }} ${{ needs.build-angle.outputs.version }}
+            Timestamp: ${{ needs.check-updates.outputs.timestamp }}
