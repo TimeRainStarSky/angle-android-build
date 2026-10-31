@@ -1,6 +1,5 @@
 set_perm_recursive "$MODPATH/system/lib64" 0 0 0755 0644 u:object_r:system_lib_file:s0
-
-chmod 0755 "$MODPATH/glinfo"
+set_perm "$MODPATH/glinfo" 0 0 0755
 ui_print "- $("$MODPATH/glinfo")"
 
 if [ -n "$KSU" ]; then

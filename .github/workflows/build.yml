@@ -25,9 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.check.outputs.commit }}
+      prev_commit: ${{ steps.check.outputs.prev_commit }}
       time: ${{ steps.check.outputs.time }}
       timestamp: ${{ steps.check.outputs.timestamp }}
-      skip: ${{ steps.check.outputs.skip }}
 
     steps:
       - name: Check for new ANGLE commits
@@ -37,30 +37,23 @@ jobs:
         run: |
           # 获取 angle/angle 仓库 main 分支的最新 commit hash
           LATEST_COMMIT=$(git ls-remote https://chromium.googlesource.com/angle/angle.git refs/heads/main | awk '{print $1}')
-          echo "commit=$LATEST_COMMIT
+          tee -a "$GITHUB_OUTPUT" << EOF
+          commit=$LATEST_COMMIT
           time=$(TZ=Asia/Shanghai date "+%F %T")
-          timestamp=$(date +%s)" | tee -a $GITHUB_OUTPUT
+          timestamp=$(date +%s)
+          EOF
 
-          FORCE_BUILD="${{ github.event.inputs.force_build }}"
-          if [[ "$FORCE_BUILD" == "true" ]]; then
-            echo "skip=false" | tee -a $GITHUB_OUTPUT
+          if [[ "${{ github.event.inputs.force_build }}" == "true" ]]; then
             exit 0
           fi
 
           # 获取上一次 nightly release 中记录的 commit hash
           PREV_COMMIT="$(gh release view nightly --repo "$GITHUB_REPOSITORY" --json body -q .body | sed -n 's/^Commit: \[\(.*\)\].*/\1/p')"
-          echo "prev_commit=$PREV_COMMIT" | tee -a $GITHUB_OUTPUT
-
-          # 如果 commit 没有变化，则跳过构建
-          if [[ "$LATEST_COMMIT" == "$PREV_COMMIT" ]]; then
-            echo "skip=true" | tee -a $GITHUB_OUTPUT
-          else
-            echo "skip=false" | tee -a $GITHUB_OUTPUT
-          fi
+          tee -a "$GITHUB_OUTPUT" <<< "prev_commit=$PREV_COMMIT"
 
   build-angle:
     needs: check-updates
-    if: needs.check-updates.outputs.skip == 'false'
+    if: needs.check-updates.outputs.commit != needs.check-updates.outputs.prev_commit
     runs-on: ubuntu-latest
 
     strategy:
@@ -98,8 +91,8 @@ jobs:
 
       - name: Set JDK environment
         run: |
-          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
-          echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
+          tee -a "$GITHUB_ENV" <<< "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
+          tee -a "$GITHUB_PATH" <<< "/usr/lib/jvm/java-17-openjdk-amd64/bin"
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
@@ -124,7 +117,7 @@ jobs:
             "$DEPOT_TOOLS_PATH"
 
       - name: Ensure depot_tools in PATH
-        run: echo "$DEPOT_TOOLS_PATH" >> $GITHUB_PATH
+        run: tee -a "$GITHUB_PATH" <<< "$DEPOT_TOOLS_PATH"
 
       - name: Configure git
         run: |
@@ -136,7 +129,7 @@ jobs:
           mkdir -p "$ANGLE_ROOT"
           cd "$ANGLE_ROOT"
 
-          cat > .gclient << 'EOF'
+          tee .gclient << 'EOF'
           solutions = [
             {
               "name": ".",
@@ -216,16 +209,23 @@ jobs:
           MAJOR=$(grep "ANGLE_MAJOR_VERSION" "$ANGLE_ROOT/src/common/angle_version.h" | awk '{print $3}' | head -n 1)
           MINOR=$(grep "ANGLE_MINOR_VERSION" "$ANGLE_ROOT/src/common/angle_version.h" | awk '{print $3}' | head -n 1)
 
-          MAJOR=${MAJOR:-2}
-          MINOR=${MINOR:-1}
-          PATCH=1
+          ANGLE_VERSION="(ANGLE ${MAJOR:-0}.${MINOR:-0}.1 git hash: ${LATEST_COMMIT:0:12})"
+          tee -a "$GITHUB_OUTPUT" <<< "version=${ANGLE_VERSION}"
 
-          ANGLE_VERSION="(ANGLE ${MAJOR}.${MINOR}.${PATCH} git hash: ${LATEST_COMMIT:0:12})"
-          TIMESTAMP="$(date +%s)"
+          tee -a module/module.prop << EOF
+          version=${{ needs.check-updates.outputs.time }} ${ANGLE_VERSION}
+          versionCode=${{ needs.check-updates.outputs.timestamp }}
+          updateJson=https://github.com/TimeRainStarSky/angle-android-build/releases/download/nightly/update-${{ matrix.arch }}.json
+          EOF
 
-          echo "version=${{ needs.check-updates.outputs.time }} ${ANGLE_VERSION}
-          versionCode=${{ needs.check-updates.outputs.timestamp }}" >> module/module.prop
-          echo "version=${ANGLE_VERSION}" | tee -a "$GITHUB_OUTPUT"
+          tee "update-${{ matrix.arch }}.json" << EOF
+          {
+            "version": "${{ needs.check-updates.outputs.time }} ${ANGLE_VERSION}",
+            "versionCode": ${{ needs.check-updates.outputs.timestamp }},
+            "zipUrl": "https://github.com/TimeRainStarSky/angle-android-build/releases/download/nightly/AngleLibraries-${{ matrix.arch }}.zip",
+            "changelog": "https://github.com/TimeRainStarSky/angle-android-build/releases/download/nightly/version.md"
+          }
+          EOF
 
           cd module
           7z -mm=xz -mx=9 a "../AngleLibraries-${{ matrix.arch }}.zip"
@@ -234,7 +234,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: angle-module-${{ matrix.arch }}
-          path: "AngleLibraries-${{ matrix.arch }}.zip"
+          path: |
+            AngleLibraries-${{ matrix.arch }}.zip
+            update-${{ matrix.arch }}.json
           if-no-files-found: error
 
   release:
@@ -252,13 +254,17 @@ jobs:
           path: assets
           merge-multiple: true
 
+      - run: |
+          tee assets/version.md << 'EOF'
+          - **Commit:** [${{ needs.check-updates.outputs.commit }}](https://chromium.googlesource.com/angle/angle/+log/${{ needs.check-updates.outputs.commit }})
+          - **Version:** ${{ needs.check-updates.outputs.time }} ${{ needs.build-angle.outputs.version }}
+          - **Timestamp:** ${{ needs.check-updates.outputs.timestamp }}
+          EOF
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: assets/*
           tag_name: nightly
           name: Nightly Build
-          body: |
-            Commit: [${{ needs.check-updates.outputs.commit }}](https://chromium.googlesource.com/angle/angle/+log/${{ needs.check-updates.outputs.commit }})
-            Version: ${{ needs.check-updates.outputs.time }} ${{ needs.build-angle.outputs.version }}
-            Timestamp: ${{ needs.check-updates.outputs.timestamp }}
+          body_path: assets/version.md
