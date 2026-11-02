@@ -2,7 +2,6 @@ name: Build ANGLE
 
 on:
   push:
-    banches: [ main ]
   schedule:
     - cron: '0 */4 * * *'
   workflow_dispatch:
@@ -48,7 +47,7 @@ jobs:
           fi
 
           # 获取上一次 nightly release 中记录的 commit hash
-          PREV_COMMIT="$(gh release view nightly --repo "$GITHUB_REPOSITORY" --json body -q .body | sed -n 's/^Commit: \[\(.*\)\].*/\1/p')"
+          PREV_COMMIT="$(gh release view nightly --repo "$GITHUB_REPOSITORY" --json body -q .body | sed -n 's/^- \*\*Commit:\*\* \[\(.*\)\].*/\1/p')"
           tee -a "$GITHUB_OUTPUT" <<< "prev_commit=$PREV_COMMIT"
 
   build-angle:
@@ -215,15 +214,15 @@ jobs:
           tee -a module/module.prop << EOF
           version=${{ needs.check-updates.outputs.time }} ${ANGLE_VERSION}
           versionCode=${{ needs.check-updates.outputs.timestamp }}
-          updateJson=https://github.com/TimeRainStarSky/angle-android-build/releases/download/nightly/update-${{ matrix.arch }}.json
+          updateJson=https://github.com/${GITHUB_REPOSITORY}/releases/download/nightly/update-${{ matrix.arch }}.json
           EOF
 
           tee "update-${{ matrix.arch }}.json" << EOF
           {
             "version": "${{ needs.check-updates.outputs.time }} ${ANGLE_VERSION}",
             "versionCode": ${{ needs.check-updates.outputs.timestamp }},
-            "zipUrl": "https://github.com/TimeRainStarSky/angle-android-build/releases/download/nightly/AngleLibraries-${{ matrix.arch }}.zip",
-            "changelog": "https://github.com/TimeRainStarSky/angle-android-build/releases/download/nightly/version.md"
+            "zipUrl": "https://github.com/${GITHUB_REPOSITORY}/releases/download/nightly/AngleLibraries-${{ matrix.arch }}.zip",
+            "changelog": "https://github.com/${GITHUB_REPOSITORY}/releases/download/nightly/version.md"
           }
           EOF
 
